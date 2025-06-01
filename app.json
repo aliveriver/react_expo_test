@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "StickerSmash",
-    "slug": "StickerSmash",
+    "slug": "aliveriver",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -12,11 +12,8 @@
       "supportsTablet": true
     },
     "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
-      },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.aliveriver.aliveriver"
     },
     "web": {
       "bundler": "metro",
@@ -28,15 +25,21 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff"
+          "backgroundColor": "#232323",
+          "image": "./assets/images/splash.png",
+          "resizeMode": "cover"
         }
       ]
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "7a505e0c-5ddc-441c-9ade-1b7a9ea74344"
+      }
+    },
+    "owner": "aliveriver"
   }
 }
