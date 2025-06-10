@@ -28,7 +28,6 @@ export default function TabLayout() {
 
         // Künstliche Verzögerung von zwei Sekunden, um eine langsame Ladeerfahrung zu simulieren.
         // Entfernen Sie dies, wenn Sie den Code kopieren und einfügen!
-        await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (e) {
         console.warn(e);
       } finally {
