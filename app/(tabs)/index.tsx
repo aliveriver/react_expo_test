@@ -1,4 +1,6 @@
 import '@/scripts/pofill';
+import * as tf from '@tensorflow/tfjs';
+import { bundleResourceIO, decodeJpeg } from '@tensorflow/tfjs-react-native';
 import * as FileSystem from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import React, { useEffect, useState } from 'react';
@@ -9,314 +11,283 @@ import {
   LayoutChangeEvent,
   Pressable,
   StyleSheet,
+  Text,
   View,
 } from 'react-native';
+// @ts-expect-error – generated at build time
 import { BIN_FILES, MODEL_JSON } from '../../scripts/genBins/out.ts';
 
-import * as tf from '@tensorflow/tfjs';
-import { bundleResourceIO, decodeJpeg } from '@tensorflow/tfjs-react-native';
+/** -----------------------------
+ *  Types
+ * ----------------------------*/
+interface DetectionResult {
+  boxes: tf.Tensor2D; // [n,4] → x1,y1,x2,y2 (pixel on 640 scale)
+  scores: tf.Tensor1D;
+  classes: tf.Tensor1D;
+}
 
-import Svg, { Rect } from 'react-native-svg';
+/** -----------------------------
+ *  Constants
+ * ----------------------------*/
+const INPUT_SIZE = 640;
 
-/* -------------------------------------------------------------------------- */
-/*                           2  图片 → Tensor 工具                           */
-/* -------------------------------------------------------------------------- */
+// 80-class COCO label list (truncated for brevity – include all in real code)
+const COCO_LABELS = [
+  'Chest Press machine',
+  'Lat Pull Down',
+  'Seated Cable Rows',
+  'arm curl machine',
+  'chest fly machine',
+  'chinning dipping',
+  'lateral raises machine',
+  'leg extension',
+  'leg press',
+  'reg curl machine',
+  'seated dip machine',
+  'shoulder press machine',
+  'smith machine',
+];
 
-console.log(BIN_FILES, MODEL_JSON, '加载成功');
+/** -----------------------------
+ *  YOLO decode: [1,84,8400] -> boxes/scores/classes
+ *  Output boxes are in pixel coordinates relative to 640 (x1,y1,x2,y2)
+ * ----------------------------*/
+function decodeYolo(raw: tf.Tensor, scoreThr = 0.25): DetectionResult {
+  const [, , n] = raw.shape; // ch = 85, n = 8400
+  const pred = raw.squeeze().transpose([1, 0]); // [8400, 84]
+  const data = pred.arraySync() as number[][];
 
-/* -------------------------------------------------------------------------- */
-/*                            1  资源与模型加载                               */
-/* -------------------------------------------------------------------------- */
+  const boxes: number[][] = [];
+  const scores: number[] = [];
+  const classes: number[] = [];
+  const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
 
-// ❗️React‑Native 必须用静态 require，无法用模板字符串动态拼；
-// 下面手动把 25 片 shard 都列出来，供 bundleResourceIO 打包。
+  for (let i = 0; i < n; i++) {
+    const [cx, cy, w, h, objLogit, ...clsLogits] = data[i];
+    const obj = sigmoid(objLogit);
+    let best = 0,
+      bestCls = 0;
+    clsLogits.forEach((logit, c) => {
+      const conf = obj * sigmoid(logit);
+      if (conf > best) {
+        best = conf;
+        bestCls = c;
+      }
+    });
+    if (best > scoreThr) {
+      boxes.push([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]);
+      scores.push(best);
+      classes.push(bestCls);
+    }
+  }
+  return {
+    boxes: tf.tensor2d(boxes),
+    scores: tf.tensor1d(scores),
+    classes: tf.tensor1d(classes, 'int32'),
+  };
+}
 
-// await tf.ready();
-// const model = await tf.loadGraphModel(bundleResourceIO(MODEL_JSON, BIN_FILES));
-
-const useYoloModel = () => {
+/** -----------------------------
+ *  Component
+ * ----------------------------*/
+export default function Home() {
   const [model, setModel] = useState<tf.GraphModel | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [uri, setUri] = useState<string | null>(null);
+  const [imgLayout, setImgLayout] = useState({ w: 1, h: 1 });
+  const [detections, setDetections] = useState<DetectionResult | null>(null);
 
+  /* model loading */
   useEffect(() => {
+    let cancelled = false;
     (async () => {
+      await tf.setBackend(
+        tf.engine().registryFactory['rn-webgl'] ? 'rn-webgl' : 'webgl'
+      );
       await tf.ready();
       const m = await tf.loadGraphModel(
         bundleResourceIO(MODEL_JSON, BIN_FILES)
       );
-      setModel(m);
+      if (!cancelled) setModel(m);
+      m.execute(tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]) as tf.Tensor);
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  return model;
-};
-
-async function uriToTensor(uri: string) {
-  const base64 = await FileSystem.readAsStringAsync(uri, {
-    encoding: FileSystem.EncodingType.Base64,
-  });
-  const raw = tf.util.encodeString(base64, 'base64').buffer;
-  const uint8 = new Uint8Array(raw);
-  return decodeJpeg(uint8); // Tensor3D [H,W,3]
-}
-
-/* -------------------------------------------------------------------------- */
-/*                       3  YOLO 推理（前/后处理省略）                        */
-/* -------------------------------------------------------------------------- */
-
-type Box = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  score: number;
-  cls: number;
-};
-
-async function detect(model: tf.GraphModel, uri: string): Promise<Box[]> {
-  const t = await uriToTensor(uri);
-  const resized = tf.image.resizeBilinear(t, [640, 640]);
-  const input = resized.expandDims(0).div(255.0);
-  const out = (await model.executeAsync(input)) as tf.Tensor;
-  const boxes = postprocess(out);
-  tf.dispose([t, resized, input, out]);
-  return boxes;
-}
-
-function postprocess(t: tf.Tensor, scoreThr = 0.25, iouThr = 0.45): Box[] {
-  const [_, ch, n] = t.shape; // 84, 8400
-  const d = t.dataSync();
-  const boxes: Box[] = [];
-  for (let i = 0; i < n; i++) {
-    const off = i * ch;
-    const scores = d.subarray(off + 4, off + ch);
-    let max = 0,
-      cls = 0;
-    for (let c = 0; c < scores.length; c++) {
-      if (scores[c] > max) {
-        max = scores[c];
-        cls = c;
-      }
-    }
-    if (max > scoreThr) {
-      boxes.push({
-        x: d[off + 0],
-        y: d[off + 1],
-        w: d[off + 2],
-        h: d[off + 3],
-        score: max,
-        cls,
-      });
-    }
-  }
-  return boxes; // ⚠️ 省略 NMS & 座标映射，示例用
-}
-
-/* -------------------------------------------------------------------------- */
-/*                                4  UI 组件                                 */
-/* -------------------------------------------------------------------------- */
-
-const DetectionOverlay = ({
-  boxes,
-  selected,
-  onSelect,
-  imgW,
-  imgH,
-}: {
-  boxes: Box[];
-  selected: number | null;
-  onSelect: (i: number) => void;
-  imgW: number;
-  imgH: number;
-}) => {
-  return (
-    <Svg style={StyleSheet.absoluteFill} pointerEvents='box-none'>
-      {boxes.map((b, i) => (
-        <Rect
-          key={i}
-          x={b.x * imgW}
-          y={b.y * imgH}
-          width={b.w * imgW}
-          height={b.h * imgH}
-          stroke={i === selected ? '#00e676' : '#ff5252'}
-          strokeWidth={2}
-          fill='transparent'
-          onPress={() => onSelect(i)}
-        />
-      ))}
-    </Svg>
-  );
-};
-
-/* -------------------------------------------------------------------------- */
-/*                      5  主页面：图片选择 + 推理流程                         */
-/* -------------------------------------------------------------------------- */
-
-export default function App() {
-  const model = useYoloModel();
-
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [detections, setDetections] = useState<Box[]>([]);
-  const [active, setActive] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [viewW, setViewW] = useState(0);
-  const [viewH, setViewH] = useState(0);
-
-  /* ----------------------------- 选择图片流程 ----------------------------- */
-
-  const pickImage = async () => {
+  /* image picker */
+  const pickImg = async () => {
     const res = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      base64: false,
       quality: 1,
     });
     if (!res.canceled) {
-      setSelectedImage(res.assets[0].uri);
-      setDetections([]);
-      setActive(null);
+      setUri(res.assets[0].uri);
+      setDetections(null);
     }
   };
 
-  const takePhoto = async () => {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission denied', 'Need camera permission');
-      return;
-    }
-    const res = await ImagePicker.launchCameraAsync({
-      base64: false,
-      quality: 1,
-    });
-    if (!res.canceled) {
-      setSelectedImage(res.assets[0].uri);
-      setDetections([]);
-      setActive(null);
-    }
+  /* NMS helper */
+  const applyNMS = async (
+    det: DetectionResult,
+    maxDet = 20,
+    iouThr = 0.5,
+    scoreThr = 0.3
+  ): Promise<DetectionResult> => {
+    const [x1s, y1s, x2s, y2s] = tf.split(det.boxes, 4, 1) as tf.Tensor[];
+    const yxyx = tf.concat([y1s, x1s, y2s, x2s], 1) as tf.Tensor2D; // cast to 2D
+
+    const idx = await tf.image.nonMaxSuppressionAsync(
+      yxyx, // <-- cast fixed the TS error
+      det.scores as tf.Tensor1D,
+      maxDet,
+      iouThr,
+      scoreThr
+    );
+
+    const boxesKept = det.boxes.gather(idx) as tf.Tensor2D;
+    const scoresKept = det.scores.gather(idx) as tf.Tensor1D;
+    const classesKept = det.classes.gather(idx) as tf.Tensor1D;
+
+    yxyx.dispose();
+    idx.dispose();
+    return { boxes: boxesKept, scores: scoresKept, classes: classesKept };
   };
 
-  /* ------------------------------ 运行检测 ------------------------------ */
-
+  /* detection */
   const runDetection = async () => {
-    if (!selectedImage || !model) return;
-    setLoading(true);
     try {
-      const boxes = await detect(model, selectedImage);
-      setDetections(boxes);
-      setActive(null);
-    } catch (err) {
-      console.error(err);
-      Alert.alert('Detection error', String(err));
+      if (!model) return Alert.alert('模型加载中…');
+      if (!uri) return Alert.alert('请先选择图片');
+      setLoading(true);
+
+      const base64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      const imgTensor = decodeJpeg(
+        new Uint8Array(tf.util.encodeString(base64, 'base64').buffer)
+      );
+      const input = tf.tidy(() =>
+        imgTensor
+          .resizeBilinear([INPUT_SIZE, INPUT_SIZE])
+          .expandDims(0)
+          .div(255)
+      );
+
+      const raw = model.execute({ images: input }) as tf.Tensor;
+      const det = decodeYolo(raw, 0.3);
+      const final = await applyNMS(det);
+      setDetections(final);
+
+      tf.dispose([imgTensor, input, raw, det.boxes, det.scores, det.classes]);
+    } catch (e) {
+      console.error(e);
     } finally {
       setLoading(false);
     }
   };
 
-  /* ------------------------------ 渲染 UI ------------------------------ */
+  /* render boxes */
+  const renderDetections = () => {
+    if (!detections) return null;
+    const boxes = detections.boxes.arraySync() as number[][];
+    const scores = detections.scores.dataSync();
+    const classes = detections.classes.dataSync();
+    const MIN = 0.2;
 
-  const onImageLayout = ({ nativeEvent }: LayoutChangeEvent) => {
-    setViewW(nativeEvent.layout.width);
-    setViewH(nativeEvent.layout.height);
+    return boxes.map(([x1, y1, x2, y2], i) => {
+      if (scores[i] < MIN) return null;
+      const left = (x1 * imgLayout.w) / INPUT_SIZE;
+      const top = (y1 * imgLayout.h) / INPUT_SIZE;
+      const width = ((x2 - x1) * imgLayout.w) / INPUT_SIZE;
+      const height = ((y2 - y1) * imgLayout.h) / INPUT_SIZE;
+      const label = COCO_LABELS[classes[i]] ?? `#${classes[i]}`;
+
+      return (
+        <View
+          key={i}
+          style={{
+            position: 'absolute',
+            left,
+            top,
+            width,
+            height,
+            borderWidth: 2,
+            borderColor: 'lime',
+          }}
+        >
+          <Text
+            style={{
+              position: 'absolute',
+              top: -18,
+              left: 0,
+              backgroundColor: 'rgba(0,0,0,0.6)',
+              color: '#fff',
+              fontSize: 12,
+              paddingHorizontal: 2,
+            }}
+          >
+            {label} {(scores[i] * 100).toFixed(1)}%
+          </Text>
+        </View>
+      );
+    });
   };
 
   return (
     <View style={styles.container}>
-      {selectedImage ? (
-        <View style={styles.preview} onLayout={onImageLayout}>
-          <Image source={{ uri: selectedImage }} style={styles.image} />
-          {!!detections.length && (
-            <DetectionOverlay
-              boxes={detections}
-              selected={active}
-              onSelect={setActive}
-              imgW={viewW}
-              imgH={viewH}
-            />
-          )}
-          {loading && (
-            <View style={styles.loading}>
-              <ActivityIndicator size='large' />
-            </View>
-          )}
+      <Text style={styles.h1}>Home</Text>
+      <Pressable style={styles.btn} onPress={pickImg}>
+        <Text style={styles.btnText}>选择图片</Text>
+      </Pressable>
+      {uri && (
+        <View style={{ width: '90%', aspectRatio: 1 }}>
+          <Image
+            source={{ uri }}
+            style={{ width: '100%', aspectRatio: 1 }}
+            onLayout={(e: LayoutChangeEvent) =>
+              setImgLayout({
+                w: e.nativeEvent.layout.width,
+                h: e.nativeEvent.layout.height,
+              })
+            }
+          />
+          {renderDetections()}
         </View>
-      ) : (
-        <View style={styles.placeholder} />
       )}
-
-      <View style={styles.buttons}>
-        <Pressable style={styles.btn} onPress={pickImage}>
-          <View>
-            <Image
-              source={require('@/assets/images/icon.png')}
-              style={styles.icon}
-            />
-          </View>
-        </Pressable>
-        <Pressable style={styles.btn} onPress={takePhoto}>
-          <Image
-            source={require('@/assets/images/icon.png')}
-            style={styles.icon}
-          />
-        </Pressable>
+      {uri && (
         <Pressable
-          style={[styles.btn, !selectedImage && styles.btnDisabled]}
+          style={[styles.btn, { marginTop: 32 }]}
           onPress={runDetection}
-          disabled={!selectedImage || loading || !model}
         >
-          <Image
-            source={require('@/assets/images/icon.png')}
-            style={styles.icon}
-          />
+          {loading ? (
+            <ActivityIndicator color='#fff' />
+          ) : (
+            <Text style={styles.btnText}>Run Detection</Text>
+          )}
         </Pressable>
-      </View>
+      )}
     </View>
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                  样式                                   */
-/* -------------------------------------------------------------------------- */
-
+/** -----------------------------
+ *  Styles
+ * ----------------------------*/
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 12,
-    backgroundColor: '#fff',
-  },
-  preview: {
-    flex: 1,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  image: {
-    width: '100%',
-    height: '100%',
-  },
-  placeholder: {
-    flex: 1,
-    borderRadius: 12,
+    alignItems: 'center',
+    paddingTop: 24,
     backgroundColor: '#eee',
   },
-  loading: {
-    ...StyleSheet.absoluteFillObject,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.25)',
-  },
-  buttons: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    marginTop: 12,
-  },
+  h1: { fontSize: 28, fontWeight: 'bold', marginBottom: 24 },
   btn: {
-    backgroundColor: '#6200ee',
-    padding: 14,
-    borderRadius: 50,
+    backgroundColor: '#4a8dff',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 8,
   },
-  btnDisabled: {
-    opacity: 0.4,
-  },
-  icon: {
-    width: 24,
-    height: 24,
-    tintColor: '#fff',
-  },
+  btnText: { color: '#fff', fontSize: 18, fontWeight: '600' },
 });
